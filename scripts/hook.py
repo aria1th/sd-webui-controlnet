@@ -5,7 +5,9 @@ import numpy as np
 import torch.nn as nn
 from functools import partial
 import modules.processing
-
+from torch.fft import (
+    fftn, ifftn, fftshift, ifftshift
+)
 
 from enum import Enum
 from scripts.logging import logger
@@ -33,6 +35,43 @@ POSITIVE_MARK_TOKEN = 1024
 NEGATIVE_MARK_TOKEN = - POSITIVE_MARK_TOKEN
 MARK_EPS = 1e-3
 
+def fourier_filter(x:torch.Tensor, threshold:float, scale:float) -> torch.Tensor:
+    """
+    Fourier filter for FreeU.
+    Apply a filter to the input tensor in the frequency domain.
+    The center of the frequency domain is scaled by the scale parameter with a threshold.
+    """
+    # if dtype is not float32, cast to float32 because cuFFT only supports float32
+    orig_dtype = x.dtype
+    if x.dtype != torch.float32:
+        x = x.float()
+    # FFT
+    x_fft = fftn(
+        x, dim=(-2, -1)
+    ) # fftn: N-Dimensional FFT
+    x_freq = fftshift(
+        x_fft, dim=(-2, -1)
+    ) # Centering the zero-frequency component
+    
+    B, C, H, W = x_freq.shape
+    mask = torch.ones((B, C, H, W), dtype=torch.bool, device=devices.device)
+    
+    center_rows, center_cols = H // 2, W // 2 # simple 1/2 centering
+    mask[..., center_rows - threshold : center_rows,
+         center_cols - threshold : center_cols] = scale # apply scale for center
+    x_freq = x_freq * mask # apply mask
+    
+    # IFFT
+    x_freq = ifftshift(
+        x_freq, dim=(-2, -1)
+    ) # Inverse of fftshift
+    x_ifft = ifftn(
+        x_freq, dim=(-2, -1)
+    ) # Inverse of fftn
+    real_part = x_ifft.real # return real part
+    if orig_dtype != torch.float32:
+        real_part = real_part.to(orig_dtype)
+    return real_part
 
 def prompt_context_is_marked(x):
     t = x[..., 0, :]
@@ -779,8 +818,17 @@ class UnetHook(nn.Module):
 
             # U-Net Decoder
             for i, module in enumerate(self.output_blocks):
+                hs_ = hs.pop()
+                if hasattr(self, 'freeu_parameter'):
+                    freeu_parameter = self.freeu_parameter
+                    if h.shape[1] == 1280:
+                        h[:,:640] = h[:,:640] * freeu_parameter.b1
+                        hs_ = fourier_filter(hs_, threshold=1, scale=freeu_parameter.s1)
+                    elif h.shape[1] == 640:
+                        h[:,:320] = h[:,:320] * freeu_parameter.b2
+                        hs_ = fourier_filter(hs_, threshold=1, scale=freeu_parameter.s2)
                 self.current_h_shape = (h.shape[0], h.shape[1], h.shape[2], h.shape[3])
-                h = th.cat([h, aligned_adding(hs.pop(), total_controlnet_embedding.pop(), require_inpaint_hijack)], dim=1)
+                h = th.cat([h, aligned_adding(hs_, total_controlnet_embedding.pop(), require_inpaint_hijack)], dim=1)
                 h = module(h, emb, context)
 
             # U-Net Output
